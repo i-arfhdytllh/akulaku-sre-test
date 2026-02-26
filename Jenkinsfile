@@ -8,6 +8,8 @@ pipeline {
         DOCKER_IMAGE_LATEST = "${APP_NAME}:latest"
         K8S_NAMESPACE = 'akulaku-sre'
         MAVEN_OPTS = '-Xmx512m'
+        PATH = "/opt/homebrew/opt/openjdk@17/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
+        JAVA_HOME = "/opt/homebrew/opt/openjdk@17"
     }
     
     options {
@@ -18,7 +20,20 @@ pipeline {
     
     stages {
         
-        // ========== STAGE 1: CHECKOUT ==========
+        stage('0. Environment Check') {
+            steps {
+                echo '=== STAGE 0: Verify All Tools ==='
+                sh '''
+                    echo "Java:     $(/opt/homebrew/opt/openjdk@17/bin/java -version 2>&1 | head -1)"
+                    echo "Maven:    $(/opt/homebrew/bin/mvn -version | head -1)"
+                    echo "Docker:   $(/usr/local/bin/docker --version)"
+                    echo "Kubectl:  $(/opt/homebrew/bin/kubectl version --client --short 2>/dev/null || /opt/homebrew/bin/kubectl version --client)"
+                    echo "Minikube: $(/opt/homebrew/bin/minikube version | head -1)"
+                    echo "Git:      $(git --version)"
+                '''
+            }
+        }
+        
         stage('1. Checkout') {
             steps {
                 echo '=== STAGE 1: Checkout Source Code ==='
@@ -31,11 +46,10 @@ pipeline {
             }
         }
         
-        // ========== STAGE 2: UNIT TEST ==========
         stage('2. Unit Test') {
             steps {
                 echo '=== STAGE 2: Running Unit Tests ==='
-                sh 'mvn test -B'
+                sh '/opt/homebrew/bin/mvn test -B'
             }
             post {
                 always {
@@ -45,13 +59,11 @@ pipeline {
             }
         }
         
-        // ========== STAGE 3: BUILD ==========
         stage('3. Maven Build') {
             steps {
                 echo '=== STAGE 3: Building Application with Maven ==='
-                sh 'mvn clean package -DskipTests -B'
-                sh 'ls -la target/'
-                sh 'echo "JAR size: $(du -sh target/hello-world.jar)"'
+                sh '/opt/homebrew/bin/mvn clean package -DskipTests -B'
+                sh 'ls -lh target/hello-world.jar'
             }
             post {
                 success {
@@ -61,116 +73,105 @@ pipeline {
             }
         }
         
-        // ========== STAGE 4: CODE QUALITY ==========
-        stage('4. Code Analysis') {
+        stage('4. Docker Build') {
             steps {
-                echo '=== STAGE 4: Code Quality Check ==='
-                sh 'mvn verify -DskipTests checkstyle:check || true'
-                echo 'Code analysis completed'
+                echo '=== STAGE 4: Building Docker Image ==='
+                sh '''
+                    eval $(/opt/homebrew/bin/minikube docker-env)
+                    /usr/local/bin/docker build -t hello-world:1.0.0 -t hello-world:latest .
+                    /usr/local/bin/docker images | grep hello-world
+                '''
             }
         }
         
-        // ========== STAGE 5: DOCKER BUILD ==========
-        stage('5. Docker Build') {
+        stage('5. Security Scan') {
             steps {
-                echo '=== STAGE 5: Building Docker Image ==='
-                sh """
-                    eval \$(minikube docker-env) || true
-                    docker build -t ${DOCKER_IMAGE} -t ${DOCKER_IMAGE_LATEST} .
-                    docker images | grep ${APP_NAME}
-                """
-            }
-        }
-        
-        // ========== STAGE 6: SECURITY SCAN ==========
-        stage('6. Security Scan') {
-            steps {
-                echo '=== STAGE 6: Docker Image Security Scan ==='
-                sh """
-                    echo "Running basic security checks..."
-                    docker inspect ${DOCKER_IMAGE} | grep -E '"User"|"ExposedPorts"'
+                echo '=== STAGE 5: Docker Image Security Scan ==='
+                sh '''
+                    eval $(/opt/homebrew/bin/minikube docker-env)
+                    echo "Checking non-root user and exposed ports..."
+                    /usr/local/bin/docker inspect hello-world:1.0.0 | grep -E '"User"|"ExposedPorts"'
                     echo "Security scan completed"
-                """
+                '''
             }
         }
         
-        // ========== STAGE 7: DEPLOY TO K8S ==========
-        stage('7. Deploy to Kubernetes') {
+        stage('6. Deploy to Kubernetes') {
             steps {
-                echo '=== STAGE 7: Deploying to Kubernetes (Minikube) ==='
-                sh """
-                    kubectl apply -f k8s/
-                    kubectl rollout status deployment/${APP_NAME} -n ${K8S_NAMESPACE} --timeout=120s
-                """
+                echo '=== STAGE 6: Deploying to Kubernetes (Minikube) ==='
+                sh '''
+                    /opt/homebrew/bin/kubectl apply -f k8s/
+                    /opt/homebrew/bin/kubectl rollout status deployment/hello-world \
+                        -n akulaku-sre --timeout=120s
+                '''
             }
         }
         
-        // ========== STAGE 8: SMOKE TEST ==========
-        stage('8. Smoke Test') {
+        stage('7. Smoke Test') {
             steps {
-                echo '=== STAGE 8: Running Smoke Tests ==='
-                sh """
+                echo '=== STAGE 7: Running Smoke Tests ==='
+                sh '''
                     sleep 15
-                    APP_URL=\$(minikube service hello-world-svc -n ${K8S_NAMESPACE} --url 2>/dev/null)
-                    echo "Testing URL: \$APP_URL"
+                    APP_URL=$(/opt/homebrew/bin/minikube service hello-world-svc \
+                        -n akulaku-sre --url 2>/dev/null)
+                    echo "Testing URL: $APP_URL"
                     
-                    # Test health endpoint
-                    HTTP_STATUS=\$(curl -s -o /dev/null -w "%{http_code}" \$APP_URL/health)
-                    echo "Health check status: \$HTTP_STATUS"
+                    HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" $APP_URL/health)
+                    echo "Health check status: $HTTP_STATUS"
                     
-                    if [ "\$HTTP_STATUS" = "200" ]; then
+                    if [ "$HTTP_STATUS" = "200" ]; then
                         echo "✅ Smoke test PASSED"
-                        curl -s \$APP_URL/ | python3 -m json.tool
+                        curl -s $APP_URL/ | python3 -m json.tool
                     else
                         echo "❌ Smoke test FAILED"
+                        /opt/homebrew/bin/kubectl get pods -n akulaku-sre
+                        /opt/homebrew/bin/kubectl logs -l app=hello-world -n akulaku-sre --tail=20
                         exit 1
                     fi
-                """
+                '''
             }
         }
         
-        // ========== STAGE 9: VERIFY DEPLOYMENT ==========
-        stage('9. Verify Deployment') {
+        stage('8. Verify Deployment') {
             steps {
-                echo '=== STAGE 9: Verifying Deployment ==='
-                sh """
-                    echo "=== Pods Status ==="
-                    kubectl get pods -n ${K8S_NAMESPACE} -o wide
-                    
-                    echo "=== Service Status ==="
-                    kubectl get svc -n ${K8S_NAMESPACE}
-                    
-                    echo "=== Deployment Status ==="
-                    kubectl get deployment -n ${K8S_NAMESPACE}
-                    
-                    echo "=== HPA Status ==="
-                    kubectl get hpa -n ${K8S_NAMESPACE} || true
-                """
+                echo '=== STAGE 8: Verify Deployment ==='
+                sh '''
+                    echo "=== Pods ==="
+                    /opt/homebrew/bin/kubectl get pods -n akulaku-sre -o wide
+                    echo "=== Services ==="
+                    /opt/homebrew/bin/kubectl get svc -n akulaku-sre
+                    echo "=== Deployment ==="
+                    /opt/homebrew/bin/kubectl get deployment -n akulaku-sre
+                    echo "=== HPA ==="
+                    /opt/homebrew/bin/kubectl get hpa -n akulaku-sre || true
+                    echo "=== App Response ==="
+                    APP_URL=$(/opt/homebrew/bin/minikube service hello-world-svc -n akulaku-sre --url 2>/dev/null)
+                    curl -s $APP_URL/ | python3 -m json.tool
+                '''
             }
         }
     }
     
     post {
         success {
-            echo """
+            echo '''
             ╔══════════════════════════════════════╗
             ║   ✅ PIPELINE SUCCESS!               ║
-            ║   App: ${APP_NAME}:${APP_VERSION}     ║
-            ║   Namespace: ${K8S_NAMESPACE}         ║
+            ║   App: hello-world:1.0.0             ║
+            ║   Namespace: akulaku-sre             ║
             ╚══════════════════════════════════════╝
-            """
+            '''
         }
         failure {
-            echo """
+            echo '''
             ╔══════════════════════════════════════╗
             ║   ❌ PIPELINE FAILED!                ║
-            ║   Check logs for details             ║
+            ║   Check logs above for details       ║
             ╚══════════════════════════════════════╝
-            """
+            '''
         }
         always {
-            echo '=== Pipeline Execution Complete ==='
-            sh 'kubectl get pods -n akulaku-sre || true'
+            sh '/opt/homebrew/bin/kubectl get pods -n akulaku-sre || true'
         }
     }
 }
