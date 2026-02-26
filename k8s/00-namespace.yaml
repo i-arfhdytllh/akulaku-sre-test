@@ -1,0 +1,8 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: akulaku-sre
+  labels:
+    app: hello-world
+    team: sre
+    owner: arif-hidayatullah

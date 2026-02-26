@@ -1,0 +1,6 @@
+target/
+*.md
+.git/
+.gitignore
+Jenkinsfile
+k8s/
