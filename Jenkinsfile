@@ -27,9 +27,8 @@ pipeline {
                     echo "Java:     $(/opt/homebrew/opt/openjdk@17/bin/java -version 2>&1 | head -1)"
                     echo "Maven:    $(/opt/homebrew/bin/mvn -version | head -1)"
                     echo "Docker:   $(/usr/local/bin/docker --version)"
-                    echo "Kubectl:  $(/opt/homebrew/bin/kubectl version --client --short 2>/dev/null || /opt/homebrew/bin/kubectl version --client)"
+                    echo "Kubectl:  $(/opt/homebrew/bin/kubectl version --client)"
                     echo "Minikube: $(/opt/homebrew/bin/minikube version | head -1)"
-                    echo "Git:      $(git --version)"
                 '''
             }
         }
@@ -109,23 +108,51 @@ pipeline {
         
         stage('7. Smoke Test') {
             steps {
-                echo '=== STAGE 7: Running Smoke Tests ==='
+                echo '=== STAGE 7: Running Smoke Tests via Port-Forward ==='
                 sh '''
-                    sleep 15
-                    APP_URL=$(/opt/homebrew/bin/minikube service hello-world-svc \
-                        -n akulaku-sre --url 2>/dev/null)
+                    # Kill existing port-forward jika ada
+                    pkill -f "port-forward.*hello-world" || true
+                    sleep 2
+                    
+                    # Start port-forward di background
+                    /opt/homebrew/bin/kubectl port-forward \
+                        svc/hello-world-svc \
+                        -n akulaku-sre \
+                        8888:80 &
+                    PF_PID=$!
+                    echo "Port-forward PID: $PF_PID"
+                    
+                    # Tunggu port-forward ready
+                    sleep 8
+                    
+                    APP_URL="http://localhost:8888"
                     echo "Testing URL: $APP_URL"
                     
-                    HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" $APP_URL/health)
-                    echo "Health check status: $HTTP_STATUS"
+                    # Retry logic
+                    MAX_RETRY=10
+                    COUNT=0
+                    until [ $COUNT -ge $MAX_RETRY ]; do
+                        HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+                            --max-time 5 $APP_URL/health || echo "000")
+                        echo "Attempt $((COUNT+1)): HTTP Status = $HTTP_STATUS"
+                        
+                        if [ "$HTTP_STATUS" = "200" ]; then
+                            echo "✅ Smoke Test PASSED"
+                            curl -s $APP_URL/ | python3 -m json.tool
+                            kill $PF_PID || true
+                            break
+                        fi
+                        
+                        COUNT=$((COUNT+1))
+                        sleep 3
+                    done
                     
-                    if [ "$HTTP_STATUS" = "200" ]; then
-                        echo "✅ Smoke test PASSED"
-                        curl -s $APP_URL/ | python3 -m json.tool
-                    else
-                        echo "❌ Smoke test FAILED"
+                    if [ $COUNT -ge $MAX_RETRY ]; then
+                        kill $PF_PID || true
+                        echo "❌ Smoke Test FAILED"
                         /opt/homebrew/bin/kubectl get pods -n akulaku-sre
-                        /opt/homebrew/bin/kubectl logs -l app=hello-world -n akulaku-sre --tail=20
+                        /opt/homebrew/bin/kubectl logs -l app=hello-world \
+                            -n akulaku-sre --tail=30
                         exit 1
                     fi
                 '''
@@ -136,17 +163,40 @@ pipeline {
             steps {
                 echo '=== STAGE 8: Verify Deployment ==='
                 sh '''
+                    # Start port-forward baru untuk verify
+                    pkill -f "port-forward.*hello-world" || true
+                    sleep 2
+                    
+                    /opt/homebrew/bin/kubectl port-forward \
+                        svc/hello-world-svc \
+                        -n akulaku-sre \
+                        8888:80 &
+                    PF_PID=$!
+                    sleep 8
+                    
                     echo "=== Pods ==="
                     /opt/homebrew/bin/kubectl get pods -n akulaku-sre -o wide
+                    
                     echo "=== Services ==="
                     /opt/homebrew/bin/kubectl get svc -n akulaku-sre
+                    
                     echo "=== Deployment ==="
                     /opt/homebrew/bin/kubectl get deployment -n akulaku-sre
+                    
                     echo "=== HPA ==="
                     /opt/homebrew/bin/kubectl get hpa -n akulaku-sre || true
-                    echo "=== App Response ==="
-                    APP_URL=$(/opt/homebrew/bin/minikube service hello-world-svc -n akulaku-sre --url 2>/dev/null)
-                    curl -s $APP_URL/ | python3 -m json.tool
+                    
+                    echo "=== Live App Response ==="
+                    curl -s http://localhost:8888/ | python3 -m json.tool
+                    
+                    echo "=== Health Check ==="
+                    curl -s http://localhost:8888/health | python3 -m json.tool
+                    
+                    echo "=== App Info ==="
+                    curl -s http://localhost:8888/info | python3 -m json.tool
+                    
+                    # Cleanup
+                    kill $PF_PID || true
                 '''
             }
         }
@@ -171,7 +221,10 @@ pipeline {
             '''
         }
         always {
-            sh '/opt/homebrew/bin/kubectl get pods -n akulaku-sre || true'
+            sh '''
+                pkill -f "port-forward.*hello-world" || true
+                /opt/homebrew/bin/kubectl get pods -n akulaku-sre || true
+            '''
         }
     }
 }
